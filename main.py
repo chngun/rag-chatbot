@@ -1,0 +1,136 @@
+import os
+from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+import streamlit as st
+
+load_dotenv()
+
+# ============ SETUP ============
+PDF_PATH = "data/cscaj.pdf"
+CHROMA_DB_PATH = "chroma_db"
+OLLAMA_BASE_URL = "http://localhost:11434"
+
+# ============ STEP 1: PDF УНШИХ ============
+def load_pdf():
+    print("📄 PDF ачаалж байна...")
+    loader = PyPDFLoader(PDF_PATH)
+    documents = loader.load()
+    print(f"✅ {len(documents)} хуудас унших")
+    return documents
+
+# ============ STEP 2: CHUNKING ============
+def chunk_documents(documents):
+    print("✂️ Текст чанкруулж байна...")
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50
+    )
+    chunks = splitter.split_documents(documents)
+    print(f"✅ {len(chunks)} чанк үүсгэлээ")
+    return chunks
+
+# ============ STEP 3: EMBEDDING + VECTOR DB ============
+def create_vectorstore(chunks):
+    print("🔢 Embedding үүсгээд Chroma-д хадгалж байна...")
+    
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text",
+        base_url=OLLAMA_BASE_URL
+    )
+    
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=CHROMA_DB_PATH
+    )
+    print("✅ Vector store үүсгэлээ")
+    return vectorstore
+
+# ============ STEP 4: RAG RETRIEVER ============
+def create_rag_chain(vectorstore):
+    print("🔗 RAG chain үүсгээд байна...")
+    
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    
+    llm = Ollama(
+        model="mistral",
+        base_url=OLLAMA_BASE_URL,
+        temperature=0
+    )
+    
+    prompt_template = ChatPromptTemplate.from_template("""
+Та боловсролын туслах AI юм. Доорх контекст ашиглан хэрэглэгчийн асуултанд хариулаарай.
+
+Дүрэм:
+1. Зөвхөн контекст дээр үндэслэн хариул
+2. Мэдэхгүй бол "Уучлаарай, энэ мэдээлэл контекстанд байхгүй" гэж хэл
+3. Монгол хэлээр хариул
+
+Контекст:
+{context}
+
+Асуулт: {question}
+
+Хариулт:""")
+    
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt_template
+        | llm
+    )
+    
+    return rag_chain
+
+# ============ STREAMLIT UI ============
+def main():
+    st.set_page_config(page_title="RAG Чатбот", layout="centered")
+    st.title("📚 Ollama RAG Чатбот (ҮНЭГҮЙ)")
+    st.write("🟢 Ollama идэвхтэй (local, үнэгүй)")
+    
+    if "vectorstore" not in st.session_state:
+        with st.spinner("💾 Өгөгдлөө боловсруулж байна..."):
+            try:
+                documents = load_pdf()
+                chunks = chunk_documents(documents)
+                st.session_state.vectorstore = create_vectorstore(chunks)
+                st.session_state.rag_chain = create_rag_chain(st.session_state.vectorstore)
+                st.success("✅ Бэлэн!")
+            except Exception as e:
+                st.error(f"❌ Алдаа: {e}")
+                st.info("⚠️ Ollama ажиллаж байгаа эсэх шалгаа: `ollama serve`")
+                return
+    
+    st.write("Хичээлийн мэдээллийн талаар асуулт асуугаарай:")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    if question := st.chat_input("Таны асуулт:"):
+        st.session_state.messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        
+        with st.chat_message("assistant"):
+            with st.spinner("⏳ Ollama сэтгэж байна..."):
+                try:
+                    response = st.session_state.rag_chain.invoke(question)
+                    st.markdown(response)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": response
+                    })
+                except Exception as e:
+                    st.error(f"❌ Алдаа: {e}")
+
+if __name__ == "__main__":
+    main()
